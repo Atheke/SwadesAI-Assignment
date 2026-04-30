@@ -29,6 +29,44 @@ const waitForRunCompletion = async (
   throw new Error(`Run ${runId} did not complete within timeout`);
 };
 
+const waitForSummary = async (
+  fetchFn: (request: Request) => Promise<Response>,
+  runId: string,
+  predicate: (body: { status: string; completedCases: number }) => boolean,
+  timeoutMs = 3000
+): Promise<{ status: string; completedCases: number }> => {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const response = await fetchFn(new Request(`http://localhost/run/${runId}`));
+    const body = (await response.json()) as { status: string; completedCases: number };
+    if (predicate(body)) {
+      return body;
+    }
+    await Bun.sleep(25);
+  }
+
+  throw new Error(`Run ${runId} did not reach expected summary within timeout`);
+};
+
+const threeCaseTestCases = [
+  {
+    id: "case-1",
+    input: "Chief complaint: cough\nDiagnosis: URI",
+    groundTruth: { chief_complaint: "cough", diagnoses: [{ description: "URI" }] }
+  },
+  {
+    id: "case-2",
+    input: "Chief complaint: fever\nDiagnosis: flu",
+    groundTruth: { chief_complaint: "fever", diagnoses: [{ description: "flu" }] }
+  },
+  {
+    id: "case-3",
+    input: "Chief complaint: pain\nDiagnosis: strain",
+    groundTruth: { chief_complaint: "pain", diagnoses: [{ description: "strain" }] }
+  }
+];
+
 const sampleTestCases = [
   {
     id: "case-1",
@@ -267,5 +305,64 @@ describe("evaluation run APIs", () => {
 
     expect(summaryBody.status).toBe("completed");
     expect(summaryBody.completedCases).toBe(1);
+  });
+
+  test("simulated interruption: resumes remaining cases without reprocessing completed", async () => {
+    const storagePath = buildStoragePath();
+    const app1 = createApp({
+      storagePath,
+      runServiceOptions: { stopAfterPersistedCaseCount: 1 }
+    });
+
+    const start = await app1.fetch(
+      new Request("http://localhost/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ testCases: threeCaseTestCases })
+      })
+    );
+
+    const { run_id: runId } = (await start.json()) as { run_id: string };
+    await app1.runService.waitForRunIdle(runId);
+
+    const partial = await waitForSummary(
+      app1.fetch,
+      runId,
+      (s) => s.completedCases === 1 && s.status === "running"
+    );
+    expect(partial.status).toBe("running");
+
+    const details1 = (await (
+      await app1.fetch(new Request(`http://localhost/run/${runId}/details`))
+    ).json()) as {
+      cases: Array<{ caseId: string; completedAt: string; trace: { resumedFromPreviousAttempt: boolean } }>;
+    };
+
+    const case1First = details1.cases.find((c) => c.caseId === "case-1");
+    expect(case1First).toBeDefined();
+    expect(case1First?.trace.resumedFromPreviousAttempt).toBeFalse();
+    const case1CompletedAt = case1First?.completedAt;
+
+    expect(details1.cases.filter((c) => c.caseId === "case-2").length).toBe(0);
+
+    const app2 = createApp({ storagePath });
+    await waitForRunCompletion(app2.fetch, runId, 5000);
+    await app2.runService.waitForRunIdle(runId);
+
+    const details2 = (await (
+      await app2.fetch(new Request(`http://localhost/run/${runId}/details`))
+    ).json()) as {
+      cases: Array<{ caseId: string; completedAt: string; trace: { resumedFromPreviousAttempt: boolean } }>;
+    };
+
+    expect(details2.cases.length).toBe(3);
+
+    const case1After = details2.cases.find((c) => c.caseId === "case-1");
+    expect(case1After?.completedAt).toBe(case1CompletedAt);
+
+    const case2 = details2.cases.find((c) => c.caseId === "case-2");
+    const case3 = details2.cases.find((c) => c.caseId === "case-3");
+    expect(case2?.trace.resumedFromPreviousAttempt).toBeTrue();
+    expect(case3?.trace.resumedFromPreviousAttempt).toBeTrue();
   });
 });

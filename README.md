@@ -15,6 +15,13 @@ This service supports end-to-end evaluation workflows:
 - Supports idempotent run creation
 - Exposes APIs to inspect run summaries and detailed traces
 
+## Resumability
+
+- After each case finishes, results and progress are written in a single JSON-store update so work is durable before the next case starts.
+- On startup, `resumeIncompleteRuns()` picks up runs in `queued` or `running` and continues only cases that do not yet have a `results[caseId]` entry (no duplicate processing).
+- Each case’s `trace.resumedFromPreviousAttempt` is `true` when that case is processed after another case was already stored for the same run (including loading partial progress from disk after a restart).
+- Tests simulate a crash mid-run with `createApp({ runServiceOptions: { stopAfterPersistedCaseCount: 1 } })`, then a second `createApp` on the same storage file to assert the remaining cases complete and the first case’s `completedAt` is unchanged.
+
 ## Architecture
 
 ```text

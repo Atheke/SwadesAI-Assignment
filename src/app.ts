@@ -1,15 +1,16 @@
 import { FileStore } from "./storage/fileStore";
-import { RunService } from "./services/run.service";
+import { RunService, type RunServiceOptions } from "./services/run.service";
 import { handleRunRoutes, notFoundResponse } from "./routes/run.routes";
 import { toErrorResponse } from "./utils/errors";
 
 interface AppOptions {
   storagePath?: string;
+  runServiceOptions?: RunServiceOptions;
 }
 
 export const createApp = (options?: AppOptions) => {
   const storagePath = options?.storagePath ?? "storage-data/runs.json";
-  const runService = new RunService(new FileStore(storagePath));
+  const runService = new RunService(new FileStore(storagePath), options?.runServiceOptions ?? {});
 
   runService.resumeIncompleteRuns().catch((error) => {
     console.error("Failed to resume runs", error);

@@ -13,10 +13,22 @@ interface StartRunInput {
   idempotencyKey?: string;
 }
 
+export interface RunServiceOptions {
+  /**
+   * Test / demo hook: after this many cases have been persisted in the current
+   * `processRunInternal` invocation, stop and leave the run `running` so a later
+   * process can resume. Only triggers when more cases remain (`n < totalCases`).
+   */
+  stopAfterPersistedCaseCount?: number;
+}
+
 export class RunService {
   private activeRuns = new Map<string, Promise<void>>();
 
-  constructor(private readonly store: FileStore) {}
+  constructor(
+    private readonly store: FileStore,
+    private readonly options: RunServiceOptions = {}
+  ) {}
 
   async resumeIncompleteRuns(): Promise<void> {
     const state = await this.store.readState();
@@ -26,6 +38,16 @@ export class RunService {
 
     for (const run of resumable) {
       this.processRun(run.id);
+    }
+  }
+
+  /**
+   * Wait until all in-flight work for `runId` finishes (used in tests to avoid races).
+   */
+  async waitForRunIdle(runId: string): Promise<void> {
+    const pending = this.activeRuns.get(runId);
+    if (pending) {
+      await pending;
     }
   }
 
@@ -180,6 +202,11 @@ export class RunService {
     this.activeRuns.set(runId, execution);
   }
 
+  /**
+   * Processes cases sequentially. Each case is written to disk in its own `updateState`
+   * before moving on, so a crash or second process can resume without redoing completed
+   * cases (`results[caseId]` is the idempotency guard inside the persist transaction).
+   */
   private async processRunInternal(runId: string): Promise<void> {
     await this.store.updateState((state) => {
       const run = state.runs[runId];
@@ -212,6 +239,10 @@ export class RunService {
         continue;
       }
 
+      // True when any case was already persisted for this run before this case runs
+      // (continuation after partial progress, including after a new process loads storage).
+      const resumedFromPreviousAttempt = Object.keys(currentRun.results).length > 0;
+
       const startedAt = Date.now();
       const prediction = processCase(testCase.input);
       const evaluation = evaluateCase(prediction, testCase.groundTruth);
@@ -231,7 +262,7 @@ export class RunService {
             "Persisted result"
           ],
           processingMs: Date.now() - startedAt,
-          resumedFromPreviousAttempt: currentRun.status === "running" && currentRun.completedCases > 0
+          resumedFromPreviousAttempt
         },
         tokenUsage,
         completedAt: new Date().toISOString()
@@ -252,6 +283,16 @@ export class RunService {
         );
         mutableRun.updatedAt = new Date().toISOString();
       });
+
+      const cap = this.options.stopAfterPersistedCaseCount;
+      if (cap !== undefined) {
+        const snap = await this.store.readState();
+        const r = snap.runs[runId];
+        const persisted = r ? Object.keys(r.results).length : 0;
+        if (r && persisted >= cap && persisted < r.totalCases) {
+          return;
+        }
+      }
     }
 
     await this.store.updateState((finalState) => {
