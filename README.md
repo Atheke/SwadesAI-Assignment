@@ -43,7 +43,9 @@ src/
     hash.ts               # Run ID generator
     idempotency-payload.ts # Canonical payload + SHA-256 for idempotency
     json.ts               # Safe JSON parser
-    validation.ts         # Input validation
+    validation.ts         # Request entry + dataset wiring
+    validation/
+      run-payload-schema.ts # Strict testCase / groundTruth schema
 tests/
   run.test.ts             # Bun tests for API and run behavior
 storage-data/
@@ -154,6 +156,15 @@ Errors return:
 {
   "error": "Invalid input",
   "details": "testCases[0].id must be a non-empty string"
+}
+```
+
+**Validation:** Top-level JSON must only include `idempotencyKey`, `testCases`, and/or `datasetPath`. Each `testCase` may only include `id`, `input`, and `groundTruth`. `groundTruth` is validated against the documented clinical-shaped schema (allowed keys: `chief_complaint`, `vitals`, `medications`, `diagnoses`, `plan`, `follow_up`); unknown properties, wrong types (e.g. numeric `vitals.hr` where a string or null is required), and malformed nested objects return **HTTP 422** with:
+
+```json
+{
+  "error": "Validation failed",
+  "details": "testCases[0].groundTruth.vitals.hr must be a string or null"
 }
 ```
 

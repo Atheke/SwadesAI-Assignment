@@ -1,8 +1,19 @@
 import { ApiError } from "./errors";
 import type { StartRunRequest, TestCase } from "../models/types";
+import { validateTestCaseArray, validateTestCaseRecord } from "./validation/run-payload-schema";
 
 const isRecord = (value: unknown): value is Record<string, unknown> => {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+};
+
+const REQUEST_TOP_LEVEL_KEYS = new Set(["idempotencyKey", "testCases", "datasetPath"]);
+
+const assertTopLevelKeys = (payload: Record<string, unknown>): void => {
+  for (const key of Object.keys(payload)) {
+    if (!REQUEST_TOP_LEVEL_KEYS.has(key)) {
+      throw new ApiError(400, "Invalid input", `Unknown property "${key}"`);
+    }
+  }
 };
 
 const assertString = (value: unknown, path: string): string => {
@@ -13,31 +24,14 @@ const assertString = (value: unknown, path: string): string => {
   return value;
 };
 
-const parseSingleTestCase = (raw: unknown, index: number): TestCase => {
-  if (!isRecord(raw)) {
-    throw new ApiError(400, "Invalid input", `testCases[${index}] must be an object`);
-  }
-
-  const id = assertString(raw.id, `testCases[${index}].id`);
-  const input = assertString(raw.input, `testCases[${index}].input`);
-
-  if (!isRecord(raw.groundTruth)) {
-    throw new ApiError(400, "Invalid input", `testCases[${index}].groundTruth must be an object`);
-  }
-
-  return {
-    id,
-    input,
-    groundTruth: raw.groundTruth
-  };
-};
-
 export const validateStartRunRequest = (
   payload: unknown
 ): { testCases?: TestCase[]; datasetPath?: string; idempotencyKey?: string } => {
   if (!isRecord(payload)) {
     throw new ApiError(400, "Invalid input", "Request body must be an object");
   }
+
+  assertTopLevelKeys(payload);
 
   const request = payload as StartRunRequest;
 
@@ -54,12 +48,7 @@ export const validateStartRunRequest = (
       : assertString(request.idempotencyKey, "idempotencyKey");
 
   if (hasTestCases) {
-    const parsed = (request.testCases as unknown[]).map(parseSingleTestCase);
-
-    if (parsed.length === 0) {
-      throw new ApiError(400, "Invalid input", "testCases cannot be empty");
-    }
-
+    const parsed = validateTestCaseArray(request.testCases, "testCases");
     return { testCases: parsed, idempotencyKey };
   }
 
@@ -67,4 +56,9 @@ export const validateStartRunRequest = (
     datasetPath: assertString(request.datasetPath, "datasetPath"),
     idempotencyKey
   };
+};
+
+/** Validates one row from a dataset JSON file (same rules as inline testCases). */
+export const validateDatasetTestCaseItem = (item: unknown, index: number): TestCase => {
+  return validateTestCaseRecord(item, `dataset[${index}]`);
 };

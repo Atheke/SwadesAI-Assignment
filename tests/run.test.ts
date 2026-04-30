@@ -192,12 +192,18 @@ describe("evaluation run APIs", () => {
         {
           id: "b",
           input: "x",
-          groundTruth: { z: 1, a: 2 }
+          groundTruth: {
+            chief_complaint: "bx",
+            diagnoses: [{ description: "db" }]
+          }
         },
         {
           id: "a",
           input: "y",
-          groundTruth: { m: 3 }
+          groundTruth: {
+            chief_complaint: "ay",
+            diagnoses: [{ description: "da" }]
+          }
         }
       ]
     };
@@ -208,12 +214,18 @@ describe("evaluation run APIs", () => {
         {
           id: "a",
           input: "y",
-          groundTruth: { m: 3 }
+          groundTruth: {
+            diagnoses: [{ description: "da" }],
+            chief_complaint: "ay"
+          }
         },
         {
           id: "b",
           input: "x",
-          groundTruth: { a: 2, z: 1 }
+          groundTruth: {
+            diagnoses: [{ description: "db" }],
+            chief_complaint: "bx"
+          }
         }
       ]
     };
@@ -257,6 +269,100 @@ describe("evaluation run APIs", () => {
     expect(response.status).toBe(400);
     expect(body.error).toBe("Invalid input");
     expect(body.details.length).toBeGreaterThan(0);
+  });
+
+  test("rejects unknown top-level property with 400", async () => {
+    const app = createApp({ storagePath: buildStoragePath() });
+    const response = await app.fetch(
+      new Request("http://localhost/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          testCases: threeCaseTestCases,
+          extraField: true
+        })
+      })
+    );
+    const body = (await response.json()) as { error: string; details: string };
+    expect(response.status).toBe(400);
+    expect(body.error).toBe("Invalid input");
+    expect(body.details).toContain("Unknown property");
+  });
+
+  test("rejects unknown groundTruth property with 422", async () => {
+    const app = createApp({ storagePath: buildStoragePath() });
+    const response = await app.fetch(
+      new Request("http://localhost/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          testCases: [
+            {
+              id: "c1",
+              input: "test",
+              groundTruth: {
+                chief_complaint: "x",
+                unknown_key: 1
+              }
+            }
+          ]
+        })
+      })
+    );
+    const body = (await response.json()) as { error: string; details: string };
+    expect(response.status).toBe(422);
+    expect(body.error).toBe("Validation failed");
+    expect(body.details).toContain("unknown or disallowed property");
+  });
+
+  test("rejects wrong vitals type with 422", async () => {
+    const app = createApp({ storagePath: buildStoragePath() });
+    const response = await app.fetch(
+      new Request("http://localhost/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          testCases: [
+            {
+              id: "c1",
+              input: "test",
+              groundTruth: {
+                chief_complaint: "x",
+                vitals: { hr: 88 }
+              }
+            }
+          ]
+        })
+      })
+    );
+    const body = (await response.json()) as { error: string; details: string };
+    expect(response.status).toBe(422);
+    expect(body.error).toBe("Validation failed");
+    expect(body.details).toContain("vitals.hr");
+  });
+
+  test("rejects malformed diagnosis with 422", async () => {
+    const app = createApp({ storagePath: buildStoragePath() });
+    const response = await app.fetch(
+      new Request("http://localhost/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          testCases: [
+            {
+              id: "c1",
+              input: "test",
+              groundTruth: {
+                diagnoses: [{ icd10: "J00" }]
+              }
+            }
+          ]
+        })
+      })
+    );
+    const body = (await response.json()) as { error: string; details: string };
+    expect(response.status).toBe(422);
+    expect(body.details).toContain("description");
   });
 
   test("returns run details endpoint output", async () => {

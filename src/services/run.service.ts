@@ -2,6 +2,7 @@ import { resolve } from "node:path";
 import { ApiError } from "../utils/errors";
 import { hashIdempotencyPayload } from "../utils/idempotency-payload";
 import { makeRunId } from "../utils/hash";
+import { validateDatasetTestCaseItem } from "../utils/validation";
 import type { CaseResult, RunRecord, RunSummary, TestCase } from "../models/types";
 import { FileStore } from "../storage/fileStore";
 import { evaluateCase } from "./evaluate.service";
@@ -139,26 +140,11 @@ export class RunService {
       throw new ApiError(400, "Invalid input", "Dataset must be an array of test cases");
     }
 
-    return parsed.map((item, index) => {
-      if (typeof item !== "object" || item === null || Array.isArray(item)) {
-        throw new ApiError(400, "Invalid input", `Dataset item at index ${index} must be an object`);
-      }
+    if (parsed.length === 0) {
+      throw new ApiError(400, "Invalid input", "Dataset cannot be empty");
+    }
 
-      const entry = item as Record<string, unknown>;
-      if (typeof entry.id !== "string" || typeof entry.input !== "string") {
-        throw new ApiError(400, "Invalid input", `Dataset item at index ${index} is missing id/input`);
-      }
-
-      if (typeof entry.groundTruth !== "object" || entry.groundTruth === null || Array.isArray(entry.groundTruth)) {
-        throw new ApiError(400, "Invalid input", `Dataset item at index ${index} requires groundTruth object`);
-      }
-
-      return {
-        id: entry.id,
-        input: entry.input,
-        groundTruth: entry.groundTruth as Record<string, unknown>
-      };
-    });
+    return parsed.map((item, index) => validateDatasetTestCaseItem(item, index));
   }
 
   /**
