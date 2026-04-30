@@ -471,4 +471,76 @@ describe("evaluation run APIs", () => {
     expect(case2?.trace.resumedFromPreviousAttempt).toBeTrue();
     expect(case3?.trace.resumedFromPreviousAttempt).toBeTrue();
   });
+
+  test("failed run exposes status and failedReason on GET /run/:id", async () => {
+    const storagePath = buildStoragePath();
+    const app = createApp({
+      storagePath,
+      runServiceOptions: { throwOnCaseId: "case-2" }
+    });
+
+    const start = await app.fetch(
+      new Request("http://localhost/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ testCases: threeCaseTestCases })
+      })
+    );
+
+    const { run_id: runId } = (await start.json()) as { run_id: string };
+    await app.runService.waitForRunIdle(runId);
+
+    const summaryRes = await app.fetch(new Request(`http://localhost/run/${runId}`));
+    const summary = (await summaryRes.json()) as {
+      status: string;
+      completedCases: number;
+      failedReason?: string;
+    };
+
+    expect(summary.status).toBe("failed");
+    expect(summary.completedCases).toBe(1);
+    expect(summary.failedReason).toContain("Simulated failure");
+
+    const detailsRes = await app.fetch(new Request(`http://localhost/run/${runId}/details`));
+    const details = (await detailsRes.json()) as {
+      status: string;
+      failedReason?: string;
+      cases: Array<{ caseId: string }>;
+    };
+
+    expect(details.status).toBe("failed");
+    expect(details.failedReason).toContain("Simulated failure");
+    expect(details.cases.length).toBe(1);
+    expect(details.cases[0]?.caseId).toBe("case-1");
+  });
+
+  test("failed runs are not resumed on a new process", async () => {
+    const storagePath = buildStoragePath();
+    const app1 = createApp({
+      storagePath,
+      runServiceOptions: { throwOnCaseId: "case-2" }
+    });
+
+    const start = await app1.fetch(
+      new Request("http://localhost/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ testCases: threeCaseTestCases })
+      })
+    );
+
+    const { run_id: runId } = (await start.json()) as { run_id: string };
+    await app1.runService.waitForRunIdle(runId);
+
+    const app2 = createApp({ storagePath });
+    await app2.runService.waitForRunIdle(runId);
+
+    const summary = (await (await app2.fetch(new Request(`http://localhost/run/${runId}`))).json()) as {
+      status: string;
+      completedCases: number;
+    };
+
+    expect(summary.status).toBe("failed");
+    expect(summary.completedCases).toBe(1);
+  });
 });

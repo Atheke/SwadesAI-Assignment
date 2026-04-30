@@ -18,9 +18,20 @@ This service supports end-to-end evaluation workflows:
 ## Resumability
 
 - After each case finishes, results and progress are written in a single JSON-store update so work is durable before the next case starts.
-- On startup, `resumeIncompleteRuns()` picks up runs in `queued` or `running` and continues only cases that do not yet have a `results[caseId]` entry (no duplicate processing).
+- On startup, `resumeIncompleteRuns()` picks up runs in `queued` or `running` and continues only cases that do not yet have a `results[caseId]` entry (no duplicate processing). Runs in `failed` or `completed` are not resumed.
 - Each case’s `trace.resumedFromPreviousAttempt` is `true` when that case is processed after another case was already stored for the same run (including loading partial progress from disk after a restart).
 - Tests simulate a crash mid-run with `createApp({ runServiceOptions: { stopAfterPersistedCaseCount: 1 } })`, then a second `createApp` on the same storage file to assert the remaining cases complete and the first case’s `completedAt` is unchanged.
+
+## Run lifecycle (`status`)
+
+| Status | Meaning |
+| --- | --- |
+| `queued` | Run record created; processing not started yet. |
+| `running` | Worker is processing cases or stopped mid-run with partial results (resumable). |
+| `completed` | All cases have persisted results. |
+| `failed` | Uncaught error while processing; partial results may exist. Not auto-resumed. |
+
+Transitions: `queued` → `running` → `completed` when every case is done, or `running` → `failed` on error. Terminal states (`completed`, `failed`) are never moved back to `running`.
 
 ## Architecture
 
@@ -136,6 +147,8 @@ Returns run summary:
   "totalCostUsd": 0.000731
 }
 ```
+
+When `status` is `failed`, the same response includes `failedReason` (string). `GET /run/:id/details` also includes `failedReason` alongside `cases`.
 
 ### `GET /run/:id/details`
 

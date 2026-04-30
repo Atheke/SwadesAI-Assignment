@@ -3,7 +3,7 @@ import { ApiError } from "../utils/errors";
 import { hashIdempotencyPayload } from "../utils/idempotency-payload";
 import { makeRunId } from "../utils/hash";
 import { validateDatasetTestCaseItem } from "../utils/validation";
-import type { CaseResult, RunRecord, RunSummary, TestCase } from "../models/types";
+import type { CaseResult, RunRecord, RunStatus, RunSummary, TestCase } from "../models/types";
 import { FileStore } from "../storage/fileStore";
 import { evaluateCase } from "./evaluate.service";
 import { processCase, simulateTokenUsage } from "./process.service";
@@ -21,6 +21,8 @@ export interface RunServiceOptions {
    * process can resume. Only triggers when more cases remain (`n < totalCases`).
    */
   stopAfterPersistedCaseCount?: number;
+  /** Test hook: throw when processing this case id so the run becomes `failed`. */
+  throwOnCaseId?: string;
 }
 
 export class RunService {
@@ -40,6 +42,32 @@ export class RunService {
     for (const run of resumable) {
       this.processRun(run.id);
     }
+  }
+
+  /**
+   * Terminal states: no further processing unless a new run is created.
+   * `failed` runs are never auto-resumed.
+   */
+  private isTerminalStatus(status: RunStatus): boolean {
+    return status === "completed" || status === "failed";
+  }
+
+  private async markRunFailed(runId: string, message: string): Promise<void> {
+    await this.store.updateState((state) => {
+      const run = state.runs[runId];
+      if (!run) {
+        return;
+      }
+      if (run.status === "completed") {
+        return;
+      }
+      if (run.status === "failed") {
+        return;
+      }
+      run.status = "failed";
+      run.failedReason = message.slice(0, 2000);
+      run.updatedAt = new Date().toISOString();
+    });
   }
 
   /**
@@ -115,7 +143,10 @@ export class RunService {
       status: run.status,
       totalCases: run.totalCases,
       completedCases: run.completedCases,
-      totalCostUsd: run.totalCostUsd
+      totalCostUsd: run.totalCostUsd,
+      ...(run.status === "failed" && run.failedReason !== undefined
+        ? { failedReason: run.failedReason }
+        : {})
     };
   }
 
@@ -189,9 +220,12 @@ export class RunService {
   }
 
   /**
-   * Processes cases sequentially. Each case is written to disk in its own `updateState`
-   * before moving on, so a crash or second process can resume without redoing completed
-   * cases (`results[caseId]` is the idempotency guard inside the persist transaction).
+   * Lifecycle: `queued` → `running` → `completed` (all cases persisted), or `running` → `failed`
+   * on uncaught error. Partial progress stays `running` until completion or failure.
+   * Terminal `completed` / `failed` are never moved backward to `running`.
+   *
+   * Each case is persisted in its own `updateState` before the next case so restarts can resume
+   * without redoing completed work (`results[caseId]` guards duplicates).
    */
   private async processRunInternal(runId: string): Promise<void> {
     await this.store.updateState((state) => {
@@ -200,98 +234,117 @@ export class RunService {
         return;
       }
 
-      if (run.status === "completed") {
+      if (this.isTerminalStatus(run.status)) {
         return;
       }
 
       run.status = "running";
+      run.failedReason = undefined;
       run.updatedAt = new Date().toISOString();
     });
 
     const state = await this.store.readState();
     const run = state.runs[runId];
-    if (!run || run.status === "completed") {
+    if (!run || this.isTerminalStatus(run.status)) {
       return;
     }
 
-    for (const testCase of run.testCases) {
-      const currentState = await this.store.readState();
-      const currentRun = currentState.runs[runId];
-      if (!currentRun) {
-        return;
-      }
-
-      if (currentRun.results[testCase.id]) {
-        continue;
-      }
-
-      // True when any case was already persisted for this run before this case runs
-      // (continuation after partial progress, including after a new process loads storage).
-      const resumedFromPreviousAttempt = Object.keys(currentRun.results).length > 0;
-
-      const startedAt = Date.now();
-      const prediction = processCase(testCase.input);
-      const evaluation = evaluateCase(prediction, testCase.groundTruth);
-      const tokenUsage = simulateTokenUsage(testCase.input, prediction);
-
-      const result: CaseResult = {
-        caseId: testCase.id,
-        input: testCase.input,
-        prediction,
-        groundTruth: testCase.groundTruth,
-        evaluation,
-        trace: {
-          steps: [
-            "Loaded test case",
-            "Generated deterministic structured prediction",
-            "Compared prediction with ground truth",
-            "Persisted result"
-          ],
-          processingMs: Date.now() - startedAt,
-          resumedFromPreviousAttempt
-        },
-        tokenUsage,
-        completedAt: new Date().toISOString()
-      };
-
-      await this.store.updateState((mutableState) => {
-        const mutableRun = mutableState.runs[runId];
-        if (!mutableRun || mutableRun.results[testCase.id]) {
+    try {
+      for (const testCase of run.testCases) {
+        const currentState = await this.store.readState();
+        const currentRun = currentState.runs[runId];
+        if (!currentRun) {
           return;
         }
 
-        mutableRun.results[testCase.id] = result;
-        mutableRun.completedCases = Object.keys(mutableRun.results).length;
-        mutableRun.totalCostUsd = Number.parseFloat(
-          Object.values(mutableRun.results)
-            .reduce((sum, item) => sum + item.tokenUsage.costUsd, 0)
-            .toFixed(6)
-        );
-        mutableRun.updatedAt = new Date().toISOString();
+        if (this.isTerminalStatus(currentRun.status)) {
+          return;
+        }
+
+        if (currentRun.results[testCase.id]) {
+          continue;
+        }
+
+        if (this.options.throwOnCaseId === testCase.id) {
+          throw new Error(`Simulated failure on case ${testCase.id}`);
+        }
+
+        // True when any case was already persisted for this run before this case runs
+        // (continuation after partial progress, including after a new process loads storage).
+        const resumedFromPreviousAttempt = Object.keys(currentRun.results).length > 0;
+
+        const startedAt = Date.now();
+        const prediction = processCase(testCase.input);
+        const evaluation = evaluateCase(prediction, testCase.groundTruth);
+        const tokenUsage = simulateTokenUsage(testCase.input, prediction);
+
+        const result: CaseResult = {
+          caseId: testCase.id,
+          input: testCase.input,
+          prediction,
+          groundTruth: testCase.groundTruth,
+          evaluation,
+          trace: {
+            steps: [
+              "Loaded test case",
+              "Generated deterministic structured prediction",
+              "Compared prediction with ground truth",
+              "Persisted result"
+            ],
+            processingMs: Date.now() - startedAt,
+            resumedFromPreviousAttempt
+          },
+          tokenUsage,
+          completedAt: new Date().toISOString()
+        };
+
+        await this.store.updateState((mutableState) => {
+          const mutableRun = mutableState.runs[runId];
+          if (!mutableRun || mutableRun.results[testCase.id]) {
+            return;
+          }
+
+          mutableRun.results[testCase.id] = result;
+          mutableRun.completedCases = Object.keys(mutableRun.results).length;
+          mutableRun.totalCostUsd = Number.parseFloat(
+            Object.values(mutableRun.results)
+              .reduce((sum, item) => sum + item.tokenUsage.costUsd, 0)
+              .toFixed(6)
+          );
+          mutableRun.updatedAt = new Date().toISOString();
+        });
+
+        const cap = this.options.stopAfterPersistedCaseCount;
+        if (cap !== undefined) {
+          const snap = await this.store.readState();
+          const r = snap.runs[runId];
+          const persisted = r ? Object.keys(r.results).length : 0;
+          if (r && persisted >= cap && persisted < r.totalCases) {
+            return;
+          }
+        }
+      }
+
+      await this.store.updateState((finalState) => {
+        const finalRun = finalState.runs[runId];
+        if (!finalRun) {
+          return;
+        }
+
+        if (finalRun.status === "failed") {
+          return;
+        }
+
+        if (finalRun.completedCases >= finalRun.totalCases) {
+          finalRun.status = "completed";
+          finalRun.failedReason = undefined;
+        }
+
+        finalRun.updatedAt = new Date().toISOString();
       });
-
-      const cap = this.options.stopAfterPersistedCaseCount;
-      if (cap !== undefined) {
-        const snap = await this.store.readState();
-        const r = snap.runs[runId];
-        const persisted = r ? Object.keys(r.results).length : 0;
-        if (r && persisted >= cap && persisted < r.totalCases) {
-          return;
-        }
-      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.markRunFailed(runId, message);
     }
-
-    await this.store.updateState((finalState) => {
-      const finalRun = finalState.runs[runId];
-      if (!finalRun) {
-        return;
-      }
-
-      if (finalRun.completedCases >= finalRun.totalCases) {
-        finalRun.status = "completed";
-      }
-
-      finalRun.updatedAt = new Date().toISOString();
-    });
   }
 }

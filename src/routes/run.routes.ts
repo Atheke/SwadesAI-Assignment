@@ -38,6 +38,9 @@ export const handleRunRoutes = async (request: Request, runService: RunService):
       totalCases: run.totalCases,
       completedCases: run.completedCases,
       totalCostUsd: run.totalCostUsd,
+      ...(run.status === "failed" && run.failedReason !== undefined
+        ? { failedReason: run.failedReason }
+        : {}),
       cases: Object.values(run.results)
     });
   }

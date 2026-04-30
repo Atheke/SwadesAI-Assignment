@@ -56,6 +56,8 @@ export interface RunSummary {
   totalCases: number;
   completedCases: number;
   totalCostUsd: number;
+  /** Present when `status` is `failed` */
+  failedReason?: string;
 }
 
 export interface IdempotencyEntry {
