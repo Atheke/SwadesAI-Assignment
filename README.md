@@ -1,237 +1,214 @@
-# Evaluation Backend System (Bun + TypeScript)
+# Clinical evaluation API
 
-Production-style backend system for running deterministic evaluation jobs on medical conversation test cases.
+HTTP API for running **evaluation jobs** on conversational **test cases**: each case supplies transcript text and structured **ground truth**. The service produces a deterministic structured **prediction**, compares it to gold, persists **per-case and run-level metrics**, and tracks **runs** (status, cost, resumability).
 
-## Overview
+Stack: **Bun**, **TypeScript**. Persistence: JSON file under `storage-data/` (configurable via app wiring; default `storage-data/runs.json`).
 
-This service supports end-to-end evaluation workflows:
+---
 
-- Accepts test cases directly or from a dataset file
-- Processes each case into structured output (deterministic mock extractor)
-- Evaluates prediction vs ground truth
-- Stores case-level and run-level results persistently
-- Tracks run status, progress, simulated token usage, and cost
-- Supports resumability after restart
-- Supports idempotent run creation
-- Exposes APIs to inspect run summaries and detailed traces
+## Requirements
 
-## Resumability
+- [Bun](https://bun.sh) installed locally
 
-- After each case finishes, results and progress are written in a single JSON-store update so work is durable before the next case starts.
-- On startup, `resumeIncompleteRuns()` picks up runs in `queued` or `running` and continues only cases that do not yet have a `results[caseId]` entry (no duplicate processing). Runs in `failed` or `completed` are not resumed.
-- Each case’s `trace.resumedFromPreviousAttempt` is `true` when that case is processed after another case was already stored for the same run (including loading partial progress from disk after a restart).
-- Tests simulate a crash mid-run with `createApp({ runServiceOptions: { stopAfterPersistedCaseCount: 1 } })`, then a second `createApp` on the same storage file to assert the remaining cases complete and the first case’s `completedAt` is unchanged.
+---
 
-## Run lifecycle (`status`)
-
-| Status | Meaning |
-| --- | --- |
-| `queued` | Run record created; processing not started yet. |
-| `running` | Worker is processing cases or stopped mid-run with partial results (resumable). |
-| `completed` | All cases have persisted results. |
-| `failed` | Uncaught error while processing; partial results may exist. Not auto-resumed. |
-
-Transitions: `queued` → `running` → `completed` when every case is done, or `running` → `failed` on error. Terminal states (`completed`, `failed`) are never moved back to `running`.
-
-## Architecture
-
-```text
-src/
-  app.ts                  # App wiring
-  server.ts               # Bun HTTP entrypoint
-  models/
-    types.ts              # Domain interfaces
-  routes/
-    run.routes.ts         # HTTP route handlers
-  services/
-    process.service.ts    # Deterministic case processor + token simulation
-    evaluate.service.ts   # Prediction vs ground truth evaluator
-    run.service.ts        # Run lifecycle, resumability, idempotency
-  storage/
-    fileStore.ts          # JSON persistence with lock-based safe updates
-  utils/
-    errors.ts             # API error formatters
-    hash.ts               # Run ID generator
-    idempotency-payload.ts # Canonical payload + SHA-256 for idempotency
-    json.ts               # Safe JSON parser
-    validation.ts         # Request entry + dataset wiring
-    validation/
-      run-payload-schema.ts # Strict testCase / groundTruth schema
-tests/
-  run.test.ts             # Bun tests for API and run behavior
-storage-data/
-  .gitkeep
-```
-
-## Setup
+## Run with Bun
 
 ```bash
+# Install dependencies
 bun install
-```
 
-## Run
-
-```bash
+# Development (watch mode)
 bun run dev
+
+# Production-style (no watch)
+bun start
 ```
 
-Server starts on `http://localhost:3000`.
-
-## Tests
+The server listens on **`http://localhost:3000`** unless you set **`PORT`** (e.g. `PORT=8080 bun run dev`).
 
 ```bash
+# Tests
 bun test
 ```
 
-## API Documentation
+---
+
+## Idempotency
+
+`POST /run` accepts an optional **`idempotencyKey`**.
+
+- **Same key + same payload** → **HTTP 200**, `reused: true`, same `run_id` as the original run. No duplicate work.
+- **Same key + different payload** → **HTTP 409** with a clear error body (see [Errors](#errors)). This prevents accidentally reusing a client key for a different job.
+- The server stores a **SHA-256** hash of a **canonical payload**: inline runs use `testCases` sorted by `id` and recursively sorted keys inside `groundTruth`; dataset runs hash the trimmed **`datasetPath` string** (file contents are not hashed).
+- Persisted mappings survive restarts. Older storage rows that only stored a run id without a hash are normalized on load; the first repeat request after upgrade records the hash for that key.
+
+---
+
+## Evaluation scoring
+
+Predictions and ground truth are compared on **flattened leaf paths** (e.g. `vitals.bp`, `diagnoses[0].description`).
+
+For each case the API reports:
+
+| Field | Meaning |
+| --- | --- |
+| `missingFields` | Path present in gold, missing in prediction |
+| `extraFields` | Path present in prediction, not in gold |
+| `mismatchedFields` | Path in both; values differ (`JSON.stringify` equality) |
+
+**Score** (0…1, inclusive):
+
+- **Errors** = `|missing| + |mismatched| + |extra|`
+- **Union size** = number of gold leaf paths + number of extra paths (= \(|E \cup P|\) over leaves)
+- **score** = `clamp(0, 1, 1 - errors / unionSize)`; if both trees are empty, score = **1**
+
+So **extra** fields lower the score, and **score = 1** only when there are no missing, mismatched, or extra leaf paths. The numeric score is consistent with the reported field lists.
+
+---
+
+## Resumability and run lifecycle
+
+- After **each** case completes, results are written in **one** durable store update before the next case starts.
+- On process start, **incomplete** runs (`queued` or `running`) are **resumed**; cases that already have `results[caseId]` are **skipped** (no duplicate processing).
+- **`failed`** and **`completed`** runs are **not** resumed.
+- Per-case **`trace.resumedFromPreviousAttempt`** is `true` when that case runs after another case was already stored for the same run (including after a restart loading partial state).
+
+| `status` | Meaning |
+| --- | --- |
+| `queued` | Run created; worker has not committed `running` yet |
+| `running` | In progress, or stopped mid-run with partial results |
+| `completed` | All cases have persisted results |
+| `failed` | Uncaught error during processing; partial results may exist; includes `failedReason` on summary/details |
+
+Allowed transitions: `queued` → `running` → `completed`, or `running` → `failed`. Terminal states are not moved backward to `running`.
+
+---
+
+## Request validation
+
+- Request body must be a JSON **object** with only: `idempotencyKey`, `testCases`, and/or `datasetPath` (plus one of `testCases` or `datasetPath` required as today).
+- Each test case allows only **`id`**, **`input`**, **`groundTruth`**. **`groundTruth`** follows a strict clinical-shaped schema (allowlisted keys, nested `vitals` / `medications` / `diagnoses` / `plan` / `follow_up` rules).
+- **HTTP 400** — malformed envelope, unknown top-level property, bad `datasetPath` type, etc.
+- **HTTP 422** — schema violations (unknown nested keys, wrong types such as a number where a string or `null` is required).
+
+---
+
+## API reference
 
 ### `POST /run`
 
-Starts a new evaluation run.
+Creates a run and starts processing asynchronously.
 
-Request body:
-
-```json
-{
-  "testCases": [
-    {
-      "id": "case-1",
-      "input": "Chief complaint: cough ...",
-      "groundTruth": {
-        "chief_complaint": "cough"
-      }
-    }
-  ],
-  "idempotencyKey": "optional-key"
-}
-```
-
-Or use dataset file path:
-
-```json
-{
-  "datasetPath": "./my-dataset.json"
-}
-```
-
-Response:
-
-```json
-{
-  "run_id": "run_xxx",
-  "reused": false
-}
-```
-
-**Idempotency:** With `idempotencyKey`, the server stores a **SHA-256** of a canonical form of the request payload (inline `testCases` sorted by id with sorted object keys in `groundTruth`, or trimmed `datasetPath` for dataset runs). The same key with the **same** payload returns **HTTP 200** and `reused: true`. The same key with a **different** payload returns **HTTP 409**:
-
-```json
-{
-  "error": "Idempotency key conflict",
-  "details": "Payload differs from original request"
-}
-```
-
-Older persisted rows that only stored `runId` (no hash) are migrated on read; the first repeat request after upgrade records the hash for that key.
-
-### `GET /run/:id`
-
-Returns run summary:
-
-```json
-{
-  "runId": "run_xxx",
-  "status": "running",
-  "totalCases": 10,
-  "completedCases": 4,
-  "totalCostUsd": 0.000731
-}
-```
-
-When `status` is `failed`, the same response includes `failedReason` (string). `GET /run/:id/details` also includes `failedReason` alongside `cases`.
-
-### `GET /run/:id/details`
-
-Returns run with per-case details including:
-
-- input
-- prediction
-- groundTruth
-- evaluation diff (`missingFields`, `extraFields`, `mismatchedFields`)
-- trace (`steps`, `processingMs`)
-- token usage and per-case cost
-
-## Error Format
-
-Errors return:
-
-```json
-{
-  "error": "Invalid input",
-  "details": "testCases[0].id must be a non-empty string"
-}
-```
-
-**Validation:** Top-level JSON must only include `idempotencyKey`, `testCases`, and/or `datasetPath`. Each `testCase` may only include `id`, `input`, and `groundTruth`. `groundTruth` is validated against the documented clinical-shaped schema (allowed keys: `chief_complaint`, `vitals`, `medications`, `diagnoses`, `plan`, `follow_up`); unknown properties, wrong types (e.g. numeric `vitals.hr` where a string or null is required), and malformed nested objects return **HTTP 422** with:
-
-```json
-{
-  "error": "Validation failed",
-  "details": "testCases[0].groundTruth.vitals.hr must be a string or null"
-}
-```
-
-Idempotency conflict (HTTP 409):
-
-```json
-{
-  "error": "Idempotency key conflict",
-  "details": "Payload differs from original request"
-}
-```
-
-## Assumptions
-
-- `processCase` is deterministic and simple by design (regex/rule-based) for assignment reliability.
-- Persistence is local JSON file-based (`storage-data/runs.json`) to keep setup lightweight.
-- Concurrency safety is handled by an in-process lock around reads/writes.
-
-## Trade-offs
-
-- JSON file storage is easy to run but not ideal for high-throughput multi-process workloads.
-- Deterministic extraction intentionally favors predictability over model realism.
-- Run processing is asynchronous in-process; horizontal scaling would require distributed coordination.
-
-## Sample API Calls
-
-Create run:
+**Response:** **201** with `run_id` and `reused: false` for a new run; **200** with `reused: true` when idempotency reuses an existing run.
 
 ```bash
-curl -X POST http://localhost:3000/run \
-  -H 'Content-Type: application/json' \
+curl -sS -X POST "http://localhost:3000/run" \
+  -H "Content-Type: application/json" \
   -d '{
-    "idempotencyKey": "demo-run-1",
+    "idempotencyKey": "client-run-001",
     "testCases": [
       {
         "id": "case-1",
-        "input": "Chief complaint: cough\\nBP: 120/80 HR: 88 Temp_f: 99.1 SpO2: 97\\nDiagnosis: viral URI\\nPlan: hydration; rest\\nFollow up in 7 days for reassessment",
+        "input": "Chief complaint: cough\nBP: 120/80 HR: 88\nDiagnosis: viral URI\nPlan: rest",
         "groundTruth": {
           "chief_complaint": "cough",
-          "vitals": {"bp": "120/80"}
+          "vitals": { "bp": "120/80", "hr": "88" },
+          "diagnoses": [{ "description": "viral URI" }],
+          "plan": ["rest"]
         }
       }
     ]
   }'
 ```
 
-Run summary:
+Dataset-based runs (JSON file = array of the same test-case objects):
 
 ```bash
-curl http://localhost:3000/run/<run_id>
+curl -sS -X POST "http://localhost:3000/run" \
+  -H "Content-Type: application/json" \
+  -d '{"datasetPath": "./data/cases.json"}'
 ```
 
-Run details:
+Idempotency conflict (different body, same key):
 
 ```bash
-curl http://localhost:3000/run/<run_id>/details
+curl -sS -w "\nHTTP %{http_code}\n" -X POST "http://localhost:3000/run" \
+  -H "Content-Type: application/json" \
+  -d '{"idempotencyKey":"client-run-001","testCases":[{"id":"x","input":"y","groundTruth":{"chief_complaint":"z"}}]}'
 ```
+
+### `GET /run/:id`
+
+Run summary: `runId`, `status`, `totalCases`, `completedCases`, `totalCostUsd`. If `status` is `failed`, **`failedReason`** is included.
+
+```bash
+RUN_ID="run_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+curl -sS "http://localhost:3000/run/${RUN_ID}"
+```
+
+### `GET /run/:id/details`
+
+Full run payload: summary fields, optional **`failedReason`**, and **`cases`** (input, prediction, ground truth, evaluation, trace, token usage).
+
+```bash
+curl -sS "http://localhost:3000/run/${RUN_ID}/details"
+```
+
+---
+
+## Errors
+
+All error responses use:
+
+```json
+{
+  "error": "Short label",
+  "details": "Human-readable detail, often with a JSON path"
+}
+```
+
+Examples:
+
+| HTTP | Typical `error` |
+| --- | --- |
+| 400 | `Invalid input` |
+| 404 | `Run not found` |
+| 409 | `Idempotency key conflict` |
+| 422 | `Validation failed` |
+
+The API layer catches validation and domain errors so malformed clients do not crash the process.
+
+---
+
+## Project layout
+
+```text
+src/
+  server.ts              # Bun.serve entry
+  app.ts                 # Routes + services wiring
+  routes/run.routes.ts
+  services/
+    run.service.ts       # Runs, idempotency, resume, lifecycle
+    process.service.ts # Deterministic extraction + simulated tokens/cost
+    evaluate.service.ts# Scoring + diffs
+  storage/fileStore.ts # JSON persistence + in-process lock
+  utils/                 # validation, idempotency hash, errors, etc.
+tests/                   # Bun tests
+```
+
+---
+
+## Assumptions
+
+- **Extraction** is **deterministic** (rule-based) so runs are reproducible without external model calls.
+- **Token and cost** fields are **simulated** from text length, not from a real LLM billing API.
+- **Single-node** usage: one process owns the JSON store; scaling out would require shared storage and coordination beyond this repo.
+
+## Trade-offs
+
+| Choice | Benefit | Limitation |
+| --- | --- | --- |
+| JSON file store | Zero external DB, easy deploy | Not ideal for high write concurrency or multi-writer clusters |
+| Strict `groundTruth` schema | Safer API contracts | Clients must shape gold data to the schema |
+| In-process run queue | Simple concurrency story | Throughput bounded by one worker pipeline per process |
