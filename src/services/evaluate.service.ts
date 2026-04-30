@@ -42,6 +42,39 @@ const flatten = (value: unknown, basePath: string): Map<string, unknown> => {
   return map;
 };
 
+/**
+ * Field-level score (0..1) from flattened leaf paths in prediction vs ground truth.
+ *
+ * Rules (all use the same flattened path keys as missingFields / extraFields / mismatchedFields):
+ *
+ * 1. missingFields — path in gold, absent in prediction → counts as one error.
+ * 2. mismatchedFields — path in both, JSON-serialized value differs → one error each.
+ * 3. extraFields — path in prediction, absent in gold → one error each.
+ *
+ * Denominator: |E ∪ P| = |expected| + |extraFields|, i.e. gold leaf paths plus prediction-only
+ * paths. Equivalently, every leaf path that appears in either tree is one "slot"; we subtract one
+ * per error above. So extras reduce the score, and the score is 1 only when there are zero
+ * missing, zero mismatched, and zero extra paths.
+ *
+ * score = max(0, 1 - errorCount / unionSize), with unionSize = 0 treated as perfect (1.0).
+ */
+const computeScore = (
+  expectedSize: number,
+  missingCount: number,
+  mismatchedCount: number,
+  extraCount: number
+): number => {
+  const errorCount = missingCount + mismatchedCount + extraCount;
+  const unionSize = expectedSize + extraCount;
+
+  if (unionSize === 0) {
+    return 1;
+  }
+
+  const raw = 1 - errorCount / unionSize;
+  return Number.parseFloat(Math.max(0, Math.min(1, raw)).toFixed(4));
+};
+
 export const evaluateCase = (
   prediction: Record<string, unknown>,
   groundTruth: Record<string, unknown>
@@ -75,9 +108,12 @@ export const evaluateCase = (
     }
   });
 
-  const maxFields = Math.max(expected.size, 1);
-  const correctFields = maxFields - missingFields.length - mismatchedFields.length;
-  const score = Number.parseFloat(Math.max(0, correctFields / maxFields).toFixed(4));
+  const score = computeScore(
+    expected.size,
+    missingFields.length,
+    mismatchedFields.length,
+    extraFields.length
+  );
 
   return {
     score,
