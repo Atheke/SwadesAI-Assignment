@@ -1,10 +1,38 @@
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { PersistedState } from "../models/types";
+import type { IdempotencyEntry, PersistedState } from "../models/types";
 
 const defaultState = (): PersistedState => ({
   runs: {},
   idempotency: {}
+});
+
+const normalizeIdempotency = (raw: Record<string, unknown>): Record<string, IdempotencyEntry> => {
+  const out: Record<string, IdempotencyEntry> = {};
+
+  for (const [key, val] of Object.entries(raw ?? {})) {
+    if (typeof val === "string") {
+      out[key] = { runId: val, payloadHash: "" };
+      continue;
+    }
+
+    if (val && typeof val === "object" && "runId" in val) {
+      const entry = val as Record<string, unknown>;
+      const runId = typeof entry.runId === "string" ? entry.runId : "";
+      const payloadHash = typeof entry.payloadHash === "string" ? entry.payloadHash : "";
+
+      if (runId) {
+        out[key] = { runId, payloadHash };
+      }
+    }
+  }
+
+  return out;
+};
+
+const normalizePersistedState = (parsed: Partial<PersistedState>): PersistedState => ({
+  runs: parsed.runs ?? {},
+  idempotency: normalizeIdempotency((parsed.idempotency ?? {}) as Record<string, unknown>)
 });
 
 export class FileStore {
@@ -25,11 +53,8 @@ export class FileStore {
     return this.withLock(async () => {
       try {
         const content = await Bun.file(this.filePath).text();
-        const parsed = JSON.parse(content) as PersistedState;
-        return {
-          runs: parsed.runs ?? {},
-          idempotency: parsed.idempotency ?? {}
-        };
+        const parsed = JSON.parse(content) as Partial<PersistedState>;
+        return normalizePersistedState(parsed);
       } catch {
         const fresh = defaultState();
         await mkdir(dirname(this.filePath), { recursive: true });
@@ -52,7 +77,7 @@ export class FileStore {
 
       try {
         const text = await Bun.file(this.filePath).text();
-        current = JSON.parse(text) as PersistedState;
+        current = normalizePersistedState(JSON.parse(text) as Partial<PersistedState>);
       } catch {
         current = defaultState();
       }

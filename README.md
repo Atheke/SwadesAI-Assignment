@@ -34,6 +34,7 @@ src/
   utils/
     errors.ts             # API error formatters
     hash.ts               # Run ID generator
+    idempotency-payload.ts # Canonical payload + SHA-256 for idempotency
     json.ts               # Safe JSON parser
     validation.ts         # Input validation
 tests/
@@ -102,6 +103,17 @@ Response:
 }
 ```
 
+**Idempotency:** With `idempotencyKey`, the server stores a **SHA-256** of a canonical form of the request payload (inline `testCases` sorted by id with sorted object keys in `groundTruth`, or trimmed `datasetPath` for dataset runs). The same key with the **same** payload returns **HTTP 200** and `reused: true`. The same key with a **different** payload returns **HTTP 409**:
+
+```json
+{
+  "error": "Idempotency key conflict",
+  "details": "Payload differs from original request"
+}
+```
+
+Older persisted rows that only stored `runId` (no hash) are migrated on read; the first repeat request after upgrade records the hash for that key.
+
 ### `GET /run/:id`
 
 Returns run summary:
@@ -129,12 +141,21 @@ Returns run with per-case details including:
 
 ## Error Format
 
-All errors return:
+Errors return:
 
 ```json
 {
   "error": "Invalid input",
   "details": "testCases[0].id must be a non-empty string"
+}
+```
+
+Idempotency conflict (HTTP 409):
+
+```json
+{
+  "error": "Idempotency key conflict",
+  "details": "Payload differs from original request"
 }
 ```
 

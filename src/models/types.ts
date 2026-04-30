@@ -58,9 +58,15 @@ export interface RunSummary {
   totalCostUsd: number;
 }
 
+export interface IdempotencyEntry {
+  runId: string;
+  /** SHA-256 hex of canonical idempotency payload; empty string = pre-hash migration / legacy */
+  payloadHash: string;
+}
+
 export interface PersistedState {
   runs: Record<string, RunRecord>;
-  idempotency: Record<string, string>;
+  idempotency: Record<string, IdempotencyEntry>;
 }
 
 export interface StartRunRequest {

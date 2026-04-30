@@ -104,6 +104,106 @@ describe("evaluation run APIs", () => {
     expect(second.status).toBe(200);
   });
 
+  test("idempotency key with different payload returns 409", async () => {
+    const app = createApp({ storagePath: buildStoragePath() });
+    const key = "idem-conflict";
+
+    const first = await app.fetch(
+      new Request("http://localhost/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          idempotencyKey: key,
+          testCases: sampleTestCases
+        })
+      })
+    );
+
+    expect(first.status).toBe(201);
+
+    const conflict = await app.fetch(
+      new Request("http://localhost/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          idempotencyKey: key,
+          testCases: [
+            {
+              id: "case-2",
+              input: "Chief complaint: fever",
+              groundTruth: { chief_complaint: "fever" }
+            }
+          ]
+        })
+      })
+    );
+
+    const body = (await conflict.json()) as { error: string; details: string };
+    expect(conflict.status).toBe(409);
+    expect(body.error).toBe("Idempotency key conflict");
+    expect(body.details).toBe("Payload differs from original request");
+  });
+
+  test("idempotency payload hash is stable for key order in groundTruth", async () => {
+    const app = createApp({ storagePath: buildStoragePath() });
+    const key = "idem-canonical";
+
+    const payloadA = {
+      idempotencyKey: key,
+      testCases: [
+        {
+          id: "b",
+          input: "x",
+          groundTruth: { z: 1, a: 2 }
+        },
+        {
+          id: "a",
+          input: "y",
+          groundTruth: { m: 3 }
+        }
+      ]
+    };
+
+    const payloadB = {
+      idempotencyKey: key,
+      testCases: [
+        {
+          id: "a",
+          input: "y",
+          groundTruth: { m: 3 }
+        },
+        {
+          id: "b",
+          input: "x",
+          groundTruth: { a: 2, z: 1 }
+        }
+      ]
+    };
+
+    const first = await app.fetch(
+      new Request("http://localhost/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payloadA)
+      })
+    );
+
+    const second = await app.fetch(
+      new Request("http://localhost/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payloadB)
+      })
+    );
+
+    const firstBody = (await first.json()) as { run_id: string; reused: boolean };
+    const secondBody = (await second.json()) as { run_id: string; reused: boolean };
+
+    expect(firstBody.run_id).toBe(secondBody.run_id);
+    expect(secondBody.reused).toBeTrue();
+    expect(second.status).toBe(200);
+  });
+
   test("returns structured validation errors", async () => {
     const app = createApp({ storagePath: buildStoragePath() });
 

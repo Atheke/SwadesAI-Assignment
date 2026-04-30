@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { ApiError } from "../utils/errors";
+import { hashIdempotencyPayload } from "../utils/idempotency-payload";
 import { makeRunId } from "../utils/hash";
 import type { CaseResult, RunRecord, RunSummary, TestCase } from "../models/types";
 import { FileStore } from "../storage/fileStore";
@@ -29,16 +30,23 @@ export class RunService {
   }
 
   async startRun(input: StartRunInput): Promise<{ runId: string; reused: boolean }> {
+    const payloadHash = hashIdempotencyPayload({
+      testCases: input.testCases,
+      datasetPath: input.datasetPath
+    });
+
+    if (input.idempotencyKey) {
+      const existingRunId = await this.resolveIdempotencyKey(input.idempotencyKey, payloadHash);
+      if (existingRunId) {
+        return { runId: existingRunId, reused: true };
+      }
+    }
+
     const datasetCases = input.datasetPath ? await this.loadDataset(input.datasetPath) : undefined;
     const testCases = input.testCases ?? datasetCases;
 
     if (!testCases || testCases.length === 0) {
       throw new ApiError(400, "Invalid input", "No test cases supplied");
-    }
-
-    const existingRunId = input.idempotencyKey ? await this.getExistingIdempotentRun(input.idempotencyKey) : null;
-    if (existingRunId) {
-      return { runId: existingRunId, reused: true };
     }
 
     const runId = makeRunId();
@@ -59,7 +67,7 @@ export class RunService {
     await this.store.updateState((state) => {
       state.runs[runId] = run;
       if (input.idempotencyKey) {
-        state.idempotency[input.idempotencyKey] = runId;
+        state.idempotency[input.idempotencyKey] = { runId, payloadHash };
       }
     });
 
@@ -131,10 +139,33 @@ export class RunService {
     });
   }
 
-  private async getExistingIdempotentRun(key: string): Promise<string | null> {
+  /**
+   * Returns existing run id to reuse, or null if this key is free.
+   * Legacy entries (payloadHash "") adopt the first seen hash after upgrade.
+   */
+  private async resolveIdempotencyKey(key: string, payloadHash: string): Promise<string | null> {
     const state = await this.store.readState();
-    const runId = state.idempotency[key];
-    return runId ?? null;
+    const entry = state.idempotency[key];
+
+    if (!entry) {
+      return null;
+    }
+
+    if (entry.payloadHash === payloadHash) {
+      return entry.runId;
+    }
+
+    if (entry.payloadHash === "") {
+      await this.store.updateState((mutable) => {
+        const current = mutable.idempotency[key];
+        if (current?.payloadHash === "") {
+          current.payloadHash = payloadHash;
+        }
+      });
+      return entry.runId;
+    }
+
+    throw new ApiError(409, "Idempotency key conflict", "Payload differs from original request");
   }
 
   private processRun(runId: string): void {
