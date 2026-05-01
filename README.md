@@ -6,6 +6,14 @@ Stack: **Bun**, **TypeScript**. Persistence: JSON file under `storage-data/` (co
 
 ---
 
+## Live endpoint
+
+**Base URL:** https://swadesai-assignment.onrender.com
+
+The API paths are the same as in [API reference](#api-reference) (e.g. `POST /run`, `GET /run/:id`). In the `curl` examples below, substitute this base URL for `http://localhost:3000` when hitting the hosted instance. Free hosting tiers may **cold-start** after idle; retry if the first request times out.
+
+---
+
 ## Requirements
 
 - [Bun](https://bun.sh) installed locally
